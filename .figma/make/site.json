@@ -1,0 +1,14 @@
+{
+  "title": "FirstFrame — Private Video Frame Extractor",
+  "description": "Securely extract the real first decoded frame from up to 10 videos and download high-quality PNGs.",
+  "openGraph": {
+    "image": "/og.png"
+  },
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": true,
+    "ignoreReducedMotion": false
+  }
+}
