@@ -92,6 +92,45 @@ describe("FirstFrame API", () => {
     expect(store.jobs.get(upload.job.id)?.status).toBe("queued")
   })
 
+  it("rejects missing and size-mismatched direct uploads before queueing", async () => {
+    const store = new MemoryApiStore()
+    const agent = request.agent(createApp(testConfig, store))
+
+    const missingBatch = await agent.post("/api/batches").expect(201)
+    const missingSigned = await agent
+      .post(`/api/batches/${missingBatch.body.id}/upload-urls`)
+      .send({ files: [video(1)] })
+      .expect(201)
+    const missingJob = store.jobs.get(missingSigned.body.uploads[0].job.id)!
+    store.objectSizes.delete(missingJob.source_storage_key)
+    const missing = await agent
+      .post(
+        `/api/batches/${missingBatch.body.id}/jobs/${missingJob.id}/complete-upload`,
+      )
+      .expect(409)
+    expect(missing.body.code).toBe("UPLOAD_MISSING")
+    expect(missingJob.status).toBe("uploading")
+
+    const mismatchBatch = await agent.post("/api/batches").expect(201)
+    const mismatchSigned = await agent
+      .post(`/api/batches/${mismatchBatch.body.id}/upload-urls`)
+      .send({ files: [video(2)] })
+      .expect(201)
+    const mismatchJob = store.jobs.get(mismatchSigned.body.uploads[0].job.id)!
+    store.objectSizes.set(
+      mismatchJob.source_storage_key,
+      mismatchJob.source_size_bytes + 1,
+    )
+    const mismatch = await agent
+      .post(
+        `/api/batches/${mismatchBatch.body.id}/jobs/${mismatchJob.id}/complete-upload`,
+      )
+      .expect(400)
+    expect(mismatch.body.code).toBe("UPLOAD_SIZE_MISMATCH")
+    expect(mismatchJob.status).toBe("cancelled")
+    expect(store.objectSizes.has(mismatchJob.source_storage_key)).toBe(false)
+  })
+
   it("never accepts a client-controlled storage path or modified ownership identifiers", async () => {
     const store = new MemoryApiStore()
     const app = createApp(testConfig, store)

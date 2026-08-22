@@ -1,9 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { downloadBlob, downloadFromApi } from "./api"
+import { downloadBlob, downloadFromApi, uploadToSignedUrl } from "./api"
+
+class FakeXmlHttpRequest {
+  static instances: FakeXmlHttpRequest[] = []
+
+  status = 0
+  upload: {
+    onprogress: ((event: ProgressEvent) => void) | null
+  } = { onprogress: null }
+  onerror: (() => void) | null = null
+  onload: (() => void) | null = null
+  open = vi.fn()
+  setRequestHeader = vi.fn()
+  send = vi.fn()
+
+  constructor() {
+    FakeXmlHttpRequest.instances.push(this)
+  }
+}
 
 describe("browser downloads", () => {
   afterEach(() => {
+    FakeXmlHttpRequest.instances = []
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
   })
 
   it("uses normal navigation instead of fetch for an individual PNG", () => {
@@ -65,5 +85,62 @@ describe("browser downloads", () => {
     expect(link.download).toBe("clip-first-frame.png")
     expect(click).toHaveBeenCalledOnce()
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:local-png")
+  })
+})
+
+describe("signed fallback uploads", () => {
+  afterEach(() => {
+    FakeXmlHttpRequest.instances = []
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it("reports a non-success storage response and preserves the fallback MIME type", async () => {
+    vi.stubGlobal("XMLHttpRequest", FakeXmlHttpRequest)
+    const progress = vi.fn()
+    const file = new Blob(["mov"], { type: "video/quicktime" }) as File
+    const pending = uploadToSignedUrl(
+      "https://storage.test/signed-upload",
+      file,
+      progress,
+      "video/quicktime",
+    )
+    const request = FakeXmlHttpRequest.instances[0]
+    request.upload.onprogress?.({
+      lengthComputable: true,
+      loaded: 1,
+      total: 2,
+    } as ProgressEvent)
+    request.status = 503
+    const rejection = expect(pending).rejects.toThrow(
+      "The direct video upload failed (503).",
+    )
+    request.onload?.()
+
+    await rejection
+    expect(request.open).toHaveBeenCalledWith(
+      "PUT",
+      "https://storage.test/signed-upload",
+    )
+    expect(request.setRequestHeader).toHaveBeenCalledWith(
+      "Content-Type",
+      "video/quicktime",
+    )
+    expect(request.send).toHaveBeenCalledWith(file)
+    expect(progress).toHaveBeenCalledWith(50)
+  })
+
+  it("reports an interrupted direct upload", async () => {
+    vi.stubGlobal("XMLHttpRequest", FakeXmlHttpRequest)
+    const pending = uploadToSignedUrl(
+      "https://storage.test/signed-upload",
+      new Blob(["video"], { type: "video/mp4" }) as File,
+      vi.fn(),
+    )
+    const rejection = expect(pending).rejects.toThrow(
+      "The direct video upload was interrupted.",
+    )
+    FakeXmlHttpRequest.instances[0].onerror?.()
+    await rejection
   })
 })

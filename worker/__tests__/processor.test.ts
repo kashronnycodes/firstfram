@@ -64,7 +64,7 @@ it("marks a failed FFmpeg job without crashing and removes temporary files", asy
   expect(await readdir(root)).toEqual([])
 })
 
-it("deletes the private source immediately after extraction and removes temporary files", async () => {
+it("processes an HEVC fallback, deletes its source immediately, and removes temporary files", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "firstframe-test-root-"))
   roots.push(root)
   const job: InternalFrameJob = {
@@ -109,18 +109,27 @@ it("deletes the private source immediately after extraction and removes temporar
     refreshBatch: async () => undefined,
     cleanupExpired: async () => 0,
   }
-  await processFrameJob(job, store, { ...testConfig, workerTempRoot: root }, {
-    probe: async () => ({
-      durationSeconds: 10,
-      width: 1920,
-      height: 1080,
-      codec: "h264",
-    }),
-    extract: async (_inputPath, outputPath) => {
-      events.push("extract")
-      await writeFile(outputPath, Buffer.from("png"))
+  await processFrameJob(
+    job,
+    store,
+    {
+      ...testConfig,
+      workerTempRoot: root,
+      allowedVideoCodecs: new Set(["h264", "hevc"]),
     },
-  })
+    {
+      probe: async () => ({
+        durationSeconds: 10,
+        width: 1920,
+        height: 1080,
+        codec: "hevc",
+      }),
+      extract: async (_inputPath, outputPath) => {
+        events.push("extract")
+        await writeFile(outputPath, Buffer.from("png"))
+      },
+    },
+  )
   expect(status).toBe("ready")
   expect(events).toEqual([
     "extract",
