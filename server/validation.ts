@@ -20,7 +20,8 @@ export const uploadBodySchema = z.object({
       }),
     )
     .min(1)
-    .max(100),
+    .max(10),
+  captchaToken: z.string().trim().min(1).max(2048).optional(),
 })
 
 export function validateUploadCandidate(
@@ -50,16 +51,4 @@ export function safeDownloadBaseName(originalName: string): string {
   const parsed = path.parse(originalName.replace(/[\\/]/g, "_"))
   const base = parsed.name.replace(/[^a-zA-Z0-9._ -]/g, "_").trim() || "frame"
   return `${base.slice(0, 120)}-first-frame.png`
-}
-
-export function uniqueOutputName(name: string, used: Set<string>): string {
-  const parsed = path.parse(name)
-  let candidate = name
-  let suffix = 2
-  while (used.has(candidate.toLowerCase())) {
-    candidate = `${parsed.name} (${suffix})${parsed.ext}`
-    suffix += 1
-  }
-  used.add(candidate.toLowerCase())
-  return candidate
 }

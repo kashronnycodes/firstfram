@@ -12,9 +12,11 @@ export interface ReadyMetadata {
 }
 
 export interface WorkerStore {
-  claim(workerId: string): Promise<InternalFrameJob | null>
+  claim(
+    workerId: string,
+    maxConcurrentPerSession: number,
+  ): Promise<InternalFrameJob | null>
   status(jobId: string): Promise<string | null>
-  progress(jobId: string, value: number): Promise<void>
   sourceStream(job: InternalFrameJob): Promise<Readable>
   uploadOutput(job: InternalFrameJob, filePath: string): Promise<void>
   markReady(job: InternalFrameJob, metadata: ReadyMetadata): Promise<boolean>
@@ -38,9 +40,13 @@ export class SupabaseWorkerStore implements WorkerStore {
     )
   }
 
-  async claim(workerId: string): Promise<InternalFrameJob | null> {
+  async claim(
+    workerId: string,
+    maxConcurrentPerSession: number,
+  ): Promise<InternalFrameJob | null> {
     const { data, error } = await this.client.rpc("claim_frame_job", {
       p_worker_id: workerId,
+      p_max_concurrent_per_session: maxConcurrentPerSession,
     })
     if (error) throw error
     const job = (data as InternalFrameJob[] | null)?.[0] ?? null
@@ -56,15 +62,6 @@ export class SupabaseWorkerStore implements WorkerStore {
       .maybeSingle()
     if (error) throw error
     return (data as { status?: string } | null)?.status ?? null
-  }
-
-  async progress(jobId: string, value: number): Promise<void> {
-    const { error } = await this.client
-      .from("frame_jobs")
-      .update({ progress: value })
-      .eq("id", jobId)
-      .eq("status", "processing")
-    if (error) throw error
   }
 
   async sourceStream(job: InternalFrameJob): Promise<Readable> {

@@ -16,7 +16,10 @@ async function runSequentialWorker() {
   console.log(`FirstFrame worker ${workerId} started (one video at a time).`)
   while (!stopping) {
     try {
-      const job = await store.claim(workerId)
+      const job = await store.claim(
+        workerId,
+        config.maxConcurrentFallbacksPerSession,
+      )
       if (!job) {
         await delay(config.workerPollMs)
         continue

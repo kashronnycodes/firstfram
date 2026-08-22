@@ -3,6 +3,8 @@ import { Readable } from "node:stream"
 import type { AppConfig } from "../config.js"
 import type {
   ApiStore,
+  CapacityDecision,
+  CapacityRequest,
   InternalBatch,
   InternalFrameJob,
   NewUploadingJob,
@@ -21,7 +23,11 @@ export const testConfig: AppConfig = {
   maxBatchSizeBytes: 10_000_000,
   maxVideoDurationSeconds: 60,
   maxJobsPerSessionPerDay: 100,
+  maxJobsPerIpPerHour: 25,
   maxJobsPerIpPerDay: 200,
+  captchaThresholdPerIpHour: 15,
+  captchaThresholdPerIpDay: 40,
+  maxConcurrentFallbacksPerSession: 2,
   maxVideosPerBatch: 10,
   retentionHours: 24,
   previewUrlTtlSeconds: 300,
@@ -29,6 +35,7 @@ export const testConfig: AppConfig = {
   workerTempRoot: undefined,
   processTimeoutMs: 10_000,
   allowedVideoCodecs: new Set(["h264"]),
+  turnstileSecretKey: undefined,
 }
 
 export class MemoryApiStore implements ApiStore {
@@ -40,7 +47,8 @@ export class MemoryApiStore implements ApiStore {
     expiresIn: number
     downloadName?: string
   }> = []
-  capacity = true
+  capacityDecision: CapacityDecision = "reserved"
+  capacityRequests: CapacityRequest[] = []
 
   async createBatch(
     guestSessionId: string,
@@ -67,8 +75,11 @@ export class MemoryApiStore implements ApiStore {
     const batch = job && this.batches.get(job.batch_id)
     return job && batch?.guest_session_id === guestSessionId ? job : null
   }
-  async reserveCapacity() {
-    return this.capacity
+  async reserveCapacity(request: CapacityRequest) {
+    this.capacityRequests.push(request)
+    if (this.capacityDecision === "captcha_required" && request.captchaVerified)
+      return "reserved" as const
+    return this.capacityDecision
   }
   async createUploadingJobs(rows: NewUploadingJob[]) {
     return rows.map((row) => {

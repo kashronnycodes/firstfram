@@ -1,5 +1,5 @@
 import request from "supertest"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { createApp } from "../app.js"
 import { MemoryApiStore, testConfig } from "./fixtures.js"
 
@@ -38,17 +38,28 @@ describe("FirstFrame API", () => {
     expect(blocked.headers["access-control-allow-origin"]).toBeUndefined()
   })
 
-  it("accepts only the first 10 videos and reports skipped files", async () => {
+  it("rejects a direct API request that exceeds 10 fallback videos", async () => {
     const store = new MemoryApiStore()
     const agent = request.agent(createApp(testConfig, store))
     const batch = await agent.post("/api/batches").expect(201)
     const response = await agent
       .post(`/api/batches/${batch.body.id}/upload-urls`)
       .send({ files: Array.from({ length: 11 }, (_, index) => video(index)) })
+      .expect(400)
+    expect(response.body.code).toBe("INVALID_INPUT")
+    expect(store.capacityRequests).toHaveLength(0)
+  })
+
+  it("accepts exactly 10 fallback videos", async () => {
+    const store = new MemoryApiStore()
+    const agent = request.agent(createApp(testConfig, store))
+    const batch = await agent.post("/api/batches").expect(201)
+    const response = await agent
+      .post(`/api/batches/${batch.body.id}/upload-urls`)
+      .send({ files: Array.from({ length: 10 }, (_, index) => video(index)) })
       .expect(201)
     expect(response.body.uploads).toHaveLength(10)
-    expect(response.body.skipped).toBe(1)
-    expect(response.body.message).toContain("1 video was skipped")
+    expect(store.capacityRequests.at(-1)?.count).toBe(10)
   })
 
   it("does not allow another guest session to read a batch", async () => {
@@ -79,6 +90,130 @@ describe("FirstFrame API", () => {
       )
       .expect(202)
     expect(store.jobs.get(upload.job.id)?.status).toBe("queued")
+  })
+
+  it("never accepts a client-controlled storage path or modified ownership identifiers", async () => {
+    const store = new MemoryApiStore()
+    const app = createApp(testConfig, store)
+    const owner = request.agent(app)
+    const stranger = request.agent(app)
+    const batch = await owner.post("/api/batches").expect(201)
+    const signed = await owner
+      .post(`/api/batches/${batch.body.id}/upload-urls`)
+      .send({
+        files: [
+          {
+            ...video(1),
+            name: "../../untrusted.mp4",
+            source_storage_key: "public/attacker-controlled.mp4",
+          },
+        ],
+      })
+      .expect(201)
+    const job = store.jobs.get(signed.body.uploads[0].job.id)!
+    expect(job.source_storage_key).toMatch(
+      new RegExp(`^sessions/[a-f0-9]{16}/${batch.body.id}/${job.id}\\.mp4$`),
+    )
+    expect(job.source_storage_key).not.toContain("attacker-controlled")
+    await stranger
+      .post(`/api/batches/${batch.body.id}/jobs/${job.id}/complete-upload`)
+      .expect(404)
+    expect(job.status).toBe("uploading")
+  })
+
+  it("rejects oversized files and oversized fallback batches before signing", async () => {
+    const store = new MemoryApiStore()
+    const agent = request.agent(
+      createApp(
+        { ...testConfig, maxFileSizeBytes: 10_000, maxBatchSizeBytes: 15_000 },
+        store,
+      ),
+    )
+    const oversizedBatch = await agent.post("/api/batches").expect(201)
+    await agent
+      .post(`/api/batches/${oversizedBatch.body.id}/upload-urls`)
+      .send({ files: [{ ...video(1), size: 10_001 }] })
+      .expect(413)
+
+    const totalBatch = await agent.post("/api/batches").expect(201)
+    const response = await agent
+      .post(`/api/batches/${totalBatch.body.id}/upload-urls`)
+      .send({
+        files: [
+          { ...video(1), size: 8_000 },
+          { ...video(2), size: 8_000 },
+        ],
+      })
+      .expect(413)
+    expect(response.body.code).toBe("BATCH_TOO_LARGE")
+    expect(store.capacityRequests).toHaveLength(0)
+  })
+
+  it.each([
+    ["hourly IP quota", "rate_limited", "FALLBACK_RATE_LIMITED"],
+    ["daily IP quota", "rate_limited", "FALLBACK_RATE_LIMITED"],
+    [
+      "concurrent processing quota",
+      "concurrent_limit",
+      "CONCURRENT_FALLBACK_LIMIT",
+    ],
+  ] as const)("enforces the %s", async (_label, decision, code) => {
+    const store = new MemoryApiStore()
+    store.capacityDecision = decision
+    const agent = request.agent(createApp(testConfig, store))
+    const batch = await agent.post("/api/batches").expect(201)
+    const response = await agent
+      .post(`/api/batches/${batch.body.id}/upload-urls`)
+      .send({ files: [video(1)] })
+      .expect(429)
+    expect(response.body.code).toBe(code)
+    expect(store.jobs.size).toBe(0)
+  })
+
+  it("requires and verifies Turnstile only after suspicious fallback usage", async () => {
+    const store = new MemoryApiStore()
+    store.capacityDecision = "captcha_required"
+    const verifyCaptcha = vi.fn(
+      async (token: string) => token === "valid-token",
+    )
+    const agent = request.agent(
+      createApp(
+        { ...testConfig, turnstileSecretKey: "turnstile-test-secret" },
+        store,
+        verifyCaptcha,
+      ),
+    )
+    const firstBatch = await agent.post("/api/batches").expect(201)
+    const required = await agent
+      .post(`/api/batches/${firstBatch.body.id}/upload-urls`)
+      .send({ files: [video(1)] })
+      .expect(403)
+    expect(required.body.code).toBe("CAPTCHA_REQUIRED")
+    expect(verifyCaptcha).not.toHaveBeenCalled()
+
+    const secondBatch = await agent.post("/api/batches").expect(201)
+    await agent
+      .post(`/api/batches/${secondBatch.body.id}/upload-urls`)
+      .send({ files: [video(2)], captchaToken: "valid-token" })
+      .expect(201)
+    expect(verifyCaptcha).toHaveBeenCalledWith(
+      "valid-token",
+      expect.any(String),
+    )
+    expect(store.capacityRequests.at(-1)?.captchaVerified).toBe(true)
+  })
+
+  it("reserves quota for each issued fallback even when earlier work fails", async () => {
+    const store = new MemoryApiStore()
+    const agent = request.agent(createApp(testConfig, store))
+    for (let index = 0; index < 2; index += 1) {
+      const batch = await agent.post("/api/batches").expect(201)
+      await agent
+        .post(`/api/batches/${batch.body.id}/upload-urls`)
+        .send({ files: [video(index)] })
+        .expect(201)
+    }
+    expect(store.capacityRequests.map((item) => item.count)).toEqual([1, 1])
   })
 
   it("downloads one PNG from localhost by redirecting navigation to a private signed URL", async () => {
@@ -115,9 +250,12 @@ describe("FirstFrame API", () => {
     expect(store.signedOutputRequests.at(-1)?.downloadName).toBe(
       "original-video-name-first-frame.png",
     )
+    expect(store.signedOutputRequests.at(-1)?.expiresIn).toBe(
+      testConfig.previewUrlTtlSeconds,
+    )
   })
 
-  it("streams Save All as an attachment ZIP", async () => {
+  it("streams an owned fallback PNG for the browser-side ZIP", async () => {
     const store = new MemoryApiStore()
     const owner = request.agent(createApp(testConfig, store))
     const batch = await owner.post("/api/batches").expect(201)
@@ -127,21 +265,29 @@ describe("FirstFrame API", () => {
       .expect(201)
     const job = store.jobs.get(signed.body.uploads[0].job.id)!
     job.status = "ready"
-    job.progress = 100
-    job.width = 1280
-    job.height = 720
-    job.output_size_bytes = 3
-
     const response = await owner
-      .get(`/api/batches/${batch.body.id}/download-all`)
+      .get(`/api/jobs/${job.id}/content`)
       .buffer(true)
       .parse(binaryParser)
       .expect(200)
+    expect(response.headers["content-type"]).toContain("image/png")
+    expect(response.headers["cache-control"]).toBe("private, no-store")
+    expect(response.body.toString()).toBe("png")
+  })
 
-    expect(response.headers["content-type"]).toContain("application/zip")
-    expect(response.headers["content-disposition"]).toContain("attachment;")
-    expect(Buffer.isBuffer(response.body)).toBe(true)
-    expect(response.body.subarray(0, 2).toString("ascii")).toBe("PK")
+  it("does not mint or expose signed preview URLs during status polling", async () => {
+    const store = new MemoryApiStore()
+    const owner = request.agent(createApp(testConfig, store))
+    const batch = await owner.post("/api/batches").expect(201)
+    const signed = await owner
+      .post(`/api/batches/${batch.body.id}/upload-urls`)
+      .send({ files: [video(1)] })
+      .expect(201)
+    store.jobs.get(signed.body.uploads[0].job.id)!.status = "ready"
+
+    const polled = await owner.get(`/api/batches/${batch.body.id}`).expect(200)
+    expect(polled.body.jobs[0].preview_url).toBeUndefined()
+    expect(store.signedOutputRequests).toHaveLength(0)
   })
 
   it("returns 403 when another guest tries either download route", async () => {
@@ -158,8 +304,6 @@ describe("FirstFrame API", () => {
     job.status = "ready"
 
     await stranger.get(`/api/jobs/${job.id}/download`).expect(403)
-    await stranger
-      .get(`/api/batches/${batch.body.id}/download-all`)
-      .expect(403)
+    await stranger.get(`/api/jobs/${job.id}/content`).expect(403)
   })
 })

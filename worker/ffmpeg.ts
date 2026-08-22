@@ -40,25 +40,33 @@ export function runMediaCommand(
       (current + chunk.toString("utf8")).slice(-65_536)
     child.stdout.on("data", (chunk: Buffer) => (stdout = append(stdout, chunk)))
     child.stderr.on("data", (chunk: Buffer) => (stderr = append(stderr, chunk)))
+    let timedOut = false
+    let settled = false
+    const finish = (error?: Error, result?: ProcessResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      error ? reject(error) : resolve(result!)
+    }
     const timer = setTimeout(() => {
+      timedOut = true
       child.kill("SIGKILL")
-      reject(
-        new MediaCommandError(
-          "Video processing exceeded the configured time limit.",
-          stderr,
-        ),
-      )
     }, timeoutMs)
     timer.unref()
     child.once("error", (error) => {
-      clearTimeout(timer)
-      reject(error)
+      finish(error)
     })
     child.once("close", (code) => {
-      clearTimeout(timer)
-      if (code === 0) resolve({ stdout, stderr })
+      if (timedOut)
+        finish(
+          new MediaCommandError(
+            "Video processing exceeded the configured time limit.",
+            stderr,
+          ),
+        )
+      else if (code === 0) finish(undefined, { stdout, stderr })
       else
-        reject(
+        finish(
           new MediaCommandError(
             `Media command exited with code ${code ?? "unknown"}.`,
             stderr,
@@ -77,10 +85,12 @@ export async function probeVideo(
     [
       "-v",
       "error",
+      "-select_streams",
+      "v:0",
       "-print_format",
       "json",
-      "-show_streams",
-      "-show_format",
+      "-show_entries",
+      "stream=codec_type,codec_name,width,height,duration:format=duration",
       inputPath,
     ],
     timeoutMs,
@@ -124,6 +134,7 @@ export async function extractFirstFrame(
   await runMediaCommand(
     ffmpegInstaller.path,
     [
+      "-nostdin",
       "-hide_banner",
       "-loglevel",
       "error",
@@ -131,10 +142,15 @@ export async function extractFirstFrame(
       inputPath,
       "-map",
       "0:v:0",
+      "-an",
+      "-sn",
+      "-dn",
       "-frames:v",
       "1",
       "-vsync",
       "0",
+      "-threads",
+      "1",
       "-compression_level",
       "3",
       "-y",

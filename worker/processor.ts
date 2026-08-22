@@ -58,14 +58,12 @@ export async function processFrameJob(
   const outputPath = path.join(tempDirectory, `${job.id}.png`)
 
   try {
-    await store.progress(job.id, 15)
     await pipeline(
       await store.sourceStream(job),
       createWriteStream(inputPath, { flags: "wx" }),
     )
     if ((await store.status(job.id)) !== "processing") return
 
-    await store.progress(job.id, 30)
     const metadata = await media.probe(inputPath, config.processTimeoutMs)
     if (metadata.durationSeconds > config.maxVideoDurationSeconds) {
       throw new Error(
@@ -76,21 +74,19 @@ export async function processFrameJob(
       throw new Error(`Unsupported codec: ${metadata.codec}.`)
     }
 
-    await store.progress(job.id, 60)
     await media.extract(inputPath, outputPath, config.processTimeoutMs)
     if ((await store.status(job.id)) !== "processing") return
     const output = await stat(outputPath)
     if (!output.isFile() || output.size === 0)
       throw new Error("FFmpeg did not produce a PNG frame.")
 
-    await store.progress(job.id, 85)
+    await store.deleteSource(job)
     await store.uploadOutput(job, outputPath)
     const committed = await store.markReady(job, {
       width: metadata.width,
       height: metadata.height,
       outputSizeBytes: output.size,
     })
-    await store.deleteSource(job)
     if (!committed) await store.deleteOutput(job)
   } catch (error) {
     await Promise.allSettled([store.deleteSource(job), store.deleteOutput(job)])

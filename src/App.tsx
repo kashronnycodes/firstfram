@@ -1,13 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import type { JobStatus, PublicFrameJob } from "../shared/contracts"
-import { downloadFromApi, firstFrameApi, uploadToSignedUrl } from "./lib/api"
+import type { JobStatus } from "../shared/contracts"
+import {
+  downloadBlob,
+  downloadFromApi,
+  FirstFrameApiError,
+  firstFrameApi,
+  uploadToSignedUrl,
+} from "./lib/api"
+import {
+  asServerJob,
+  collectReadyZipEntries,
+  type ClientFrameJob,
+  createLocalPlaceholder,
+  mergeServerJobs,
+  pngDownloadName,
+} from "./lib/client-jobs"
+import {
+  extractLocalFirstFrame,
+  LocalExtractionError,
+  processSequentially,
+} from "./lib/local-frame"
 
 const MAX_VIDEOS = 10
 const MAX_FILE_SIZE = Number(
-  import.meta.env.VITE_MAX_FILE_SIZE_BYTES ?? 536_870_912,
+  import.meta.env.VITE_MAX_FILE_SIZE_BYTES ?? 524_288_000,
 )
 const MAX_BATCH_SIZE = Number(
-  import.meta.env.VITE_MAX_BATCH_SIZE_BYTES ?? 2_147_483_648,
+  import.meta.env.VITE_MAX_BATCH_SIZE_BYTES ?? 1_073_741_824,
 )
 const ACTIVE_STATUSES: JobStatus[] = ["uploading", "queued", "processing"]
 const ACCEPTED_TYPES: Record<string, string[]> = {
@@ -234,7 +253,7 @@ function ClipRow({
   localError,
   onRemove,
 }: {
-  job: PublicFrameJob
+  job: ClientFrameJob
   uploadProgress?: number
   localError?: string
   onRemove: () => void
@@ -354,7 +373,7 @@ function FramePreviewCard({
   job,
   onSave,
 }: {
-  job: PublicFrameJob
+  job: ClientFrameJob
   onSave: () => void
 }) {
   const baseName = job.original_name.replace(/\.[^.]+$/, "")
@@ -650,7 +669,7 @@ function Workspace({
   onClear,
   onSaveAll,
 }: {
-  jobs: PublicFrameJob[]
+  jobs: ClientFrameJob[]
   uploadProgress: Record<string, number>
   localErrors: Record<string, string>
   notice: string
@@ -770,8 +789,17 @@ function Workspace({
                   onClick={() => input.current?.click()}
                   disabled={busy || jobs.length >= MAX_VIDEOS}
                 >
-                  {busy ? "UPLOADING…" : "⬆ CHOOSE VIDEOS"}
+                  {busy ? "PROCESSING…" : "⬆ CHOOSE VIDEOS"}
                 </PixelBtn>
+                <div
+                  style={{
+                    font: "9px/1.5 'JetBrains Mono', monospace",
+                    color: "#3dd68c",
+                    textAlign: "center",
+                  }}
+                >
+                  Videos are processed on your device whenever possible.
+                </div>
               </div>
               <div className="slots">SLOTS: {jobs.length} / 10 USED</div>
             </div>
@@ -887,7 +915,7 @@ function Workspace({
               color: "#c8b89a",
             }}
           >
-            SOURCE VIDEOS ARE DELETED AFTER PROCESSING
+            LOCAL WHEN POSSIBLE · FALLBACK SOURCES DELETED AFTER PROCESSING
           </div>
           <div
             style={{
@@ -913,8 +941,8 @@ function ExtractedFrames({
   jobs,
   onSave,
 }: {
-  jobs: PublicFrameJob[]
-  onSave: (job: PublicFrameJob) => void
+  jobs: ClientFrameJob[]
+  onSave: (job: ClientFrameJob) => void
 }) {
   const ready = jobs.filter((job) => job.status === "ready")
   return (
@@ -963,12 +991,12 @@ function HowItWorks() {
     {
       num: "01",
       title: "UPLOAD",
-      desc: "Choose up to 10 MP4, MOV, M4V, or WebM files. Each one uploads directly to private temporary storage.",
+      desc: "Choose up to 10 MP4, MOV, M4V, or WebM files. FirstFrame tries private on-device extraction first.",
     },
     {
       num: "02",
       title: "EXTRACT",
-      desc: "A separate FFmpeg worker validates each real video and extracts one first decoded frame at original resolution.",
+      desc: "Compatible videos stay on your device. Only videos your browser cannot decode use the private FFmpeg fallback.",
     },
     {
       num: "03",
@@ -1089,10 +1117,10 @@ function PrivacyBanner() {
             PRIVATE & TEMPORARY
           </div>
           <div style={{ font: "14px/1.8 Inter, sans-serif", color: "#c8b89a" }}>
-            Videos upload through short-lived signed links into private storage.
-            Source files are deleted immediately after extraction; PNGs and
-            expired batch records are automatically removed after 24 hours by
-            default.
+            Videos are processed on your device whenever possible. Compatibility
+            fallbacks use short-lived signed uploads to private storage; source
+            files are deleted immediately after extraction and temporary PNGs
+            expire automatically.
           </div>
         </div>
         <div style={{ display: "grid", gap: 8 }}>
@@ -1163,151 +1191,391 @@ function Footer() {
   )
 }
 
+type FallbackCandidate = { file: File; placeholderId: string }
+
+function acceptedVideo(file: File): boolean {
+  const dot = file.name.lastIndexOf(".")
+  const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : ""
+  const accepted = ACCEPTED_TYPES[extension]
+  return Boolean(
+    accepted && (!file.type || accepted.includes(file.type.toLowerCase())),
+  )
+}
+
+function fallbackMimeType(file: File): string {
+  const dot = file.name.lastIndexOf(".")
+  const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : ""
+  return (
+    file.type || ACCEPTED_TYPES[extension]?.[0] || "application/octet-stream"
+  )
+}
+
 export default function App() {
   const [batchId, setBatchId] = useState<string | null>(() =>
     sessionStorage.getItem("firstframe_batch"),
   )
-  const [jobs, setJobs] = useState<PublicFrameJob[]>([])
+  const batchIdRef = useRef(batchId)
+  const [jobs, setJobs] = useState<ClientFrameJob[]>([])
+  const jobsRef = useRef<ClientFrameJob[]>([])
+  const localControllers = useRef(new Map<string, AbortController>())
+  const localPreviewUrls = useRef(new Map<string, string>())
+  const pollStartedAt = useRef<number | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState(
-    "Files are processed temporarily and automatically deleted.",
+    "Videos are processed on your device whenever possible.",
   )
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>(
     {},
   )
   const [localErrors, setLocalErrors] = useState<Record<string, string>>({})
 
-  const refresh = useCallback(async (id: string) => {
-    try {
-      const batch = await firstFrameApi.getBatch(id)
-      setJobs(batch.jobs)
-    } catch (error) {
-      setNotice(
-        error instanceof Error
-          ? error.message
-          : "This batch is no longer available.",
-      )
-      sessionStorage.removeItem("firstframe_batch")
-      setBatchId(null)
-      setJobs([])
-    }
-  }, [])
+  const updateJobs = useCallback(
+    (updater: (current: ClientFrameJob[]) => ClientFrameJob[]) => {
+      setJobs((current) => {
+        const next = updater(current)
+        jobsRef.current = next
+        return next
+      })
+    },
+    [],
+  )
+
+  const refresh = useCallback(
+    async (id: string) => {
+      try {
+        const batch = await firstFrameApi.getBatch(id)
+        updateJobs((current) =>
+          mergeServerJobs(current, batch.jobs, firstFrameApi.outputContentUrl),
+        )
+      } catch (error) {
+        setNotice(
+          error instanceof Error
+            ? error.message
+            : "This fallback batch is no longer available.",
+        )
+        sessionStorage.removeItem("firstframe_batch")
+        batchIdRef.current = null
+        setBatchId(null)
+        updateJobs((current) =>
+          current.filter((job) => job.processingMode === "local"),
+        )
+      }
+    },
+    [updateJobs],
+  )
 
   useEffect(() => {
     if (batchId) void refresh(batchId)
   }, [batchId, refresh])
+
+  const hasActiveFallback = jobs.some(
+    (job) =>
+      job.processingMode === "server" &&
+      job.batch_id !== "local" &&
+      ACTIVE_STATUSES.includes(job.status),
+  )
   useEffect(() => {
-    if (!batchId || !jobs.some((job) => ACTIVE_STATUSES.includes(job.status)))
+    if (!batchId || !hasActiveFallback) {
+      pollStartedAt.current = null
       return
-    const timer = window.setInterval(() => void refresh(batchId), 1_500)
-    return () => window.clearInterval(timer)
-  }, [batchId, jobs, refresh])
+    }
+    pollStartedAt.current ??= Date.now()
+    let cancelled = false
+    let timer = 0
+    const poll = async () => {
+      await refresh(batchId)
+      if (cancelled) return
+      const elapsed = Date.now() - (pollStartedAt.current ?? Date.now())
+      const delay = elapsed < 10_000 ? 1_500 : elapsed < 30_000 ? 3_000 : 5_000
+      timer = window.setTimeout(poll, delay)
+    }
+    timer = window.setTimeout(poll, 1_500)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [batchId, hasActiveFallback, refresh])
+
+  useEffect(
+    () => () => {
+      for (const controller of localControllers.current.values())
+        controller.abort()
+      for (const url of localPreviewUrls.current.values())
+        URL.revokeObjectURL(url)
+    },
+    [],
+  )
 
   const ensureBatch = async () => {
-    if (batchId) return batchId
+    if (batchIdRef.current) return batchIdRef.current
     const batch = await firstFrameApi.createBatch()
+    batchIdRef.current = batch.id
     setBatchId(batch.id)
     sessionStorage.setItem("firstframe_batch", batch.id)
     return batch.id
   }
 
+  const failPlaceholders = (
+    candidates: readonly FallbackCandidate[],
+    message: string,
+  ) => {
+    const ids = new Set(candidates.map((item) => item.placeholderId))
+    updateJobs((current) =>
+      current.map((job) =>
+        ids.has(job.id)
+          ? {
+              ...job,
+              status: "failed",
+              progress: 0,
+              error_message: message,
+              completed_at: new Date().toISOString(),
+            }
+          : job,
+      ),
+    )
+  }
+
+  const uploadFallbacks = async (
+    fallbackCandidates: readonly FallbackCandidate[],
+    captchaToken?: string,
+  ) => {
+    const oversized = fallbackCandidates.filter(
+      (candidate) => candidate.file.size > MAX_FILE_SIZE,
+    )
+    if (oversized.length)
+      failPlaceholders(
+        oversized,
+        "This video is too large for the compatibility fallback.",
+      )
+    const accepted = fallbackCandidates.filter(
+      (candidate) => candidate.file.size <= MAX_FILE_SIZE,
+    )
+    if (!accepted.length) return
+    const existingFallbackBytes = jobsRef.current
+      .filter(
+        (job) =>
+          job.processingMode === "server" &&
+          !accepted.some((candidate) => candidate.placeholderId === job.id),
+      )
+      .reduce((sum, job) => sum + job.source_size_bytes, 0)
+    const newFallbackBytes = accepted.reduce(
+      (sum, candidate) => sum + candidate.file.size,
+      0,
+    )
+    if (existingFallbackBytes + newFallbackBytes > MAX_BATCH_SIZE) {
+      failPlaceholders(
+        accepted,
+        "These compatibility fallbacks exceed the 1 GB batch upload limit.",
+      )
+      return
+    }
+
+    const id = await ensureBatch()
+    const result = await firstFrameApi.createUploadUrls(
+      id,
+      accepted.map(({ file }) => ({
+        name: file.name,
+        size: file.size,
+        type: fallbackMimeType(file),
+      })),
+      captchaToken,
+    )
+    const bindings = result.uploads.map((upload, index) => ({
+      upload,
+      file: accepted[index].file,
+      placeholderId: accepted[index].placeholderId,
+    }))
+    const replacements = new Map(
+      bindings.map(({ placeholderId, upload }) => [
+        placeholderId,
+        asServerJob(upload.job),
+      ]),
+    )
+    updateJobs((current) =>
+      current.map((job) => replacements.get(job.id) ?? job),
+    )
+
+    await processSequentially(
+      bindings,
+      async ({ upload, file }) => {
+        await uploadToSignedUrl(
+          upload.upload_url,
+          file,
+          (percent) =>
+            setUploadProgress((current) => ({
+              ...current,
+              [upload.job.id]: percent,
+            })),
+          fallbackMimeType(file),
+        )
+        await firstFrameApi.completeUpload(id, upload.job.id)
+      },
+      async (result, { upload }) => {
+        if (result.status === "fulfilled") return
+        const message =
+          result.reason instanceof Error
+            ? result.reason.message
+            : "Upload failed."
+        setLocalErrors((current) => ({
+          ...current,
+          [upload.job.id]: message,
+        }))
+        await firstFrameApi.cancelJob(upload.job.id).catch(() => undefined)
+      },
+    )
+    await refresh(id)
+  }
+
   const handleFiles = async (fileList: FileList) => {
     if (busy) return
     const candidates = Array.from(fileList)
-    const remaining = MAX_VIDEOS - jobs.length
+    const remaining = MAX_VIDEOS - jobsRef.current.length
     if (remaining <= 0) {
       setNotice("This batch already contains 10 videos.")
       return
     }
-    const invalid = candidates.find((file) => {
-      const extension = file.name
-        .slice(file.name.lastIndexOf("."))
-        .toLowerCase()
-      return (
-        !ACCEPTED_TYPES[extension]?.includes(file.type.toLowerCase()) ||
-        file.size > MAX_FILE_SIZE
-      )
-    })
+    const invalid = candidates.find((file) => !acceptedVideo(file))
     if (invalid) {
       setNotice(
-        `${invalid.name} is unsupported or larger than the configured file limit.`,
+        `${invalid.name} is not a supported MP4, MOV, M4V, or WebM video.`,
       )
       return
     }
     const selected = candidates.slice(0, remaining)
-    const total =
-      jobs.reduce((sum, job) => sum + job.source_size_bytes, 0) +
-      selected.reduce((sum, file) => sum + file.size, 0)
-    if (total > MAX_BATCH_SIZE) {
-      setNotice("Those files exceed the configured total batch size.")
-      return
-    }
+    const skipped = candidates.length - selected.length
+    const placeholders = selected.map((file, index) =>
+      createLocalPlaceholder(file, jobsRef.current.length + index),
+    )
+    updateJobs((current) => [...current, ...placeholders])
     setBusy(true)
+    const fallbacks: FallbackCandidate[] = []
     try {
-      const id = await ensureBatch()
-      const result = await firstFrameApi.createUploadUrls(
-        id,
-        selected.map((file) => ({
-          name: file.name,
-          size: file.size,
-          type: file.type,
-        })),
-      )
-      setJobs((current) => [
-        ...current,
-        ...result.uploads.map((item) => item.job),
-      ])
-      const skipped = candidates.length - selected.length + result.skipped
-      setNotice(
-        skipped
-          ? `${skipped} video${
-              skipped === 1 ? " was" : "s were"
-            } skipped; each batch accepts the first 10.`
-          : "Uploading directly to private temporary storage…",
-      )
-      await Promise.all(
-        result.uploads.map(async (item, index) => {
-          try {
-            await uploadToSignedUrl(
-              item.upload_url,
-              selected[index],
-              (percent) =>
-                setUploadProgress((current) => ({
-                  ...current,
-                  [item.job.id]: percent,
-                })),
+      setNotice("Extracting first frames privately on your device…")
+      await processSequentially(
+        selected,
+        async (file, index) => {
+          const placeholder = placeholders[index]
+          const controller = new AbortController()
+          localControllers.current.set(placeholder.id, controller)
+          return extractLocalFirstFrame(file, { signal: controller.signal })
+        },
+        (result, file, index) => {
+          const placeholder = placeholders[index]
+          localControllers.current.delete(placeholder.id)
+          if (result.status === "fulfilled") {
+            const previewUrl = URL.createObjectURL(result.value.png)
+            localPreviewUrls.current.set(placeholder.id, previewUrl)
+            updateJobs((current) =>
+              current.map((job) =>
+                job.id === placeholder.id
+                  ? {
+                      ...job,
+                      status: "ready",
+                      progress: 100,
+                      width: result.value.width,
+                      height: result.value.height,
+                      output_size_bytes: result.value.png.size,
+                      preview_url: previewUrl,
+                      localOutput: result.value.png,
+                      completed_at: new Date().toISOString(),
+                    }
+                  : job,
+              ),
             )
-            await firstFrameApi.completeUpload(id, item.job.id)
-          } catch (error) {
-            const message =
-              error instanceof Error ? error.message : "Upload failed."
-            setLocalErrors((current) => ({
-              ...current,
-              [item.job.id]: message,
-            }))
-            await firstFrameApi.cancelJob(item.job.id).catch(() => undefined)
+            return
           }
-        }),
+          if (
+            result.reason instanceof LocalExtractionError &&
+            result.reason.code === "aborted"
+          )
+            return
+          fallbacks.push({ file, placeholderId: placeholder.id })
+          updateJobs((current) =>
+            current.map((job) =>
+              job.id === placeholder.id
+                ? {
+                    ...job,
+                    processingMode: "server",
+                    status: "uploading",
+                    progress: 0,
+                  }
+                : job,
+            ),
+          )
+        },
       )
-      await refresh(id)
-      setNotice(
-        "Uploads complete. The worker is extracting one video at a time.",
-      )
+
+      if (fallbacks.length) {
+        setNotice(
+          `${fallbacks.length} video${
+            fallbacks.length === 1 ? " needs" : "s need"
+          } the secure compatibility fallback…`,
+        )
+        await uploadFallbacks(fallbacks)
+        setNotice(
+          "Local frames are ready. Compatibility fallbacks are extracting one at a time.",
+        )
+      } else {
+        setNotice("Processed privately on your device. Nothing was uploaded.")
+      }
+      if (skipped)
+        setNotice(
+          `${skipped} video${
+            skipped === 1 ? " was" : "s were"
+          } skipped; each visible batch accepts 10.`,
+        )
     } catch (error) {
-      setNotice(
+      const message =
         error instanceof Error
           ? error.message
-          : "The upload could not be started.",
-      )
+          : "Processing could not be started."
+      if (
+        error instanceof FirstFrameApiError &&
+        error.code === "CAPTCHA_REQUIRED" &&
+        fallbacks.length
+      ) {
+        try {
+          const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY?.trim()
+          if (!siteKey)
+            throw new Error(
+              "Fallback verification is required but is not configured.",
+            )
+          setNotice("Please complete verification to continue server fallback.")
+          const { requestTurnstileToken } = await import("./lib/turnstile")
+          const token = await requestTurnstileToken(siteKey)
+          await uploadFallbacks(fallbacks, token)
+          setNotice(
+            "Verification complete. Compatibility fallbacks are extracting.",
+          )
+        } catch (challengeError) {
+          const challengeMessage =
+            challengeError instanceof Error
+              ? challengeError.message
+              : "Verification failed."
+          setNotice(challengeMessage)
+          failPlaceholders(fallbacks, challengeMessage)
+        }
+      } else {
+        setNotice(message)
+        failPlaceholders(fallbacks, message)
+      }
     } finally {
       setBusy(false)
     }
   }
 
   const removeJob = async (jobId: string) => {
+    const job = jobsRef.current.find((candidate) => candidate.id === jobId)
+    if (!job) return
     try {
-      await firstFrameApi.deleteJob(jobId)
-      setJobs((current) => current.filter((job) => job.id !== jobId))
+      localControllers.current.get(jobId)?.abort()
+      localControllers.current.delete(jobId)
+      const previewUrl = localPreviewUrls.current.get(jobId)
+      if (previewUrl) URL.revokeObjectURL(previewUrl)
+      localPreviewUrls.current.delete(jobId)
+      if (job.processingMode === "server" && job.batch_id !== "local")
+        await firstFrameApi.deleteJob(jobId)
+      updateJobs((current) => current.filter((item) => item.id !== jobId))
     } catch (error) {
       setNotice(
         error instanceof Error
@@ -1316,11 +1584,18 @@ export default function App() {
       )
     }
   }
+
   const clearAll = async () => {
-    if (!batchId) return
     try {
-      await firstFrameApi.clearBatch(batchId)
-      setJobs([])
+      for (const controller of localControllers.current.values())
+        controller.abort()
+      if (batchId) await firstFrameApi.clearBatch(batchId)
+      for (const url of localPreviewUrls.current.values())
+        URL.revokeObjectURL(url)
+      localControllers.current.clear()
+      localPreviewUrls.current.clear()
+      updateJobs(() => [])
+      batchIdRef.current = null
       setBatchId(null)
       sessionStorage.removeItem("firstframe_batch")
       setNotice("The queue and all temporary results were cleared.")
@@ -1332,8 +1607,13 @@ export default function App() {
       )
     }
   }
-  const saveOne = async (job: PublicFrameJob) => {
+
+  const saveOne = async (job: ClientFrameJob) => {
     try {
+      if (job.processingMode === "local" && job.localOutput) {
+        downloadBlob(job.localOutput, pngDownloadName(job.original_name))
+        return
+      }
       downloadFromApi(`/api/jobs/${job.id}/download`)
     } catch (error) {
       setNotice(
@@ -1343,15 +1623,25 @@ export default function App() {
       )
     }
   }
+
   const saveAll = async () => {
-    if (!batchId) return
+    const ready = jobsRef.current.filter((job) => job.status === "ready")
+    if (!ready.length) return
     try {
-      downloadFromApi(`/api/batches/${batchId}/download-all`)
+      setNotice("Preparing the ZIP in your browser…")
+      const { createStoredZip } = await import("./lib/zip")
+      const entries = await collectReadyZipEntries(
+        ready,
+        firstFrameApi.fetchOutput,
+      )
+      const zip = await createStoredZip(entries)
+      downloadBlob(zip, `firstframe-${batchId?.slice(0, 8) ?? "local"}.zip`)
+      setNotice("ZIP created locally. No ZIP was uploaded or stored.")
     } catch (error) {
       setNotice(
         error instanceof Error
           ? error.message
-          : "The ZIP could not be downloaded.",
+          : "The ZIP could not be created.",
       )
     }
   }

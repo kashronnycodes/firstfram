@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto"
 import path from "node:path"
-import archiver from "archiver"
 import cookieParser from "cookie-parser"
 import cors from "cors"
 import express, { type Request } from "express"
@@ -12,9 +11,9 @@ import { ApiError, errorHandler, notFound } from "./errors.js"
 import { guestSession, requestIpHash, type GuestRequest } from "./session.js"
 import type { ApiStore, InternalBatch } from "./store.js"
 import { toPublicJob } from "./store.js"
+import { createTurnstileVerifier, type CaptchaVerifier } from "./turnstile.js"
 import {
   safeDownloadBaseName,
-  uniqueOutputName,
   uploadBodySchema,
   validateUploadCandidate,
 } from "./validation.js"
@@ -40,28 +39,19 @@ async function requireBatch(
   return batch
 }
 
-async function publicBatch(
-  store: ApiStore,
-  batch: InternalBatch,
-  config: AppConfig,
-) {
-  const jobs = await Promise.all(
-    batch.jobs.map(async (job) => {
-      const safeJob = toPublicJob(job)
-      if (job.status === "ready") {
-        safeJob.preview_url = await store.createOutputSignedUrl(
-          job.output_storage_key,
-          config.previewUrlTtlSeconds,
-        )
-      }
-      return safeJob
-    }),
-  )
+function publicBatch(batch: InternalBatch) {
+  const jobs = batch.jobs.map(toPublicJob)
   const { guest_session_id: _session, ...safeBatch } = batch
   return { ...safeBatch, jobs }
 }
 
-export function createApp(config: AppConfig, store: ApiStore) {
+export function createApp(
+  config: AppConfig,
+  store: ApiStore,
+  verifyCaptcha: CaptchaVerifier = createTurnstileVerifier(
+    config.turnstileSecretKey,
+  ),
+) {
   const app = express()
   app.set("trust proxy", 1)
   app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }))
@@ -100,7 +90,7 @@ export function createApp(config: AppConfig, store: ApiStore) {
       guest(request).guestSessionId,
       expiresAt,
     )
-    response.status(201).json(await publicBatch(store, batch, config))
+    response.status(201).json(publicBatch(batch))
   })
 
   app.post("/api/batches/:batchId/upload-urls", async (request, response) => {
@@ -113,10 +103,14 @@ export function createApp(config: AppConfig, store: ApiStore) {
     const remaining = Math.max(0, config.maxVideosPerBatch - batch.jobs.length)
     if (remaining === 0)
       throw new ApiError(409, "This batch already has 10 videos.", "BATCH_FULL")
+    if (parsed.files.length > remaining)
+      throw new ApiError(
+        400,
+        `This request would exceed the ${config.maxVideosPerBatch}-video fallback batch limit.`,
+        "BATCH_LIMIT_EXCEEDED",
+      )
 
-    const acceptedInput = parsed.files.slice(0, remaining)
-    const skipped = parsed.files.length - acceptedInput.length
-    const accepted = acceptedInput.map((file) =>
+    const accepted = parsed.files.map((file) =>
       validateUploadCandidate(file, config),
     )
     const existingSize = batch.jobs.reduce(
@@ -132,18 +126,46 @@ export function createApp(config: AppConfig, store: ApiStore) {
       )
     }
 
-    const capacity = await store.reserveCapacity(
-      guest(request).guestSessionId,
-      requestIpHash(request, config.sessionSecret),
-      accepted.length,
-      config.maxJobsPerSessionPerDay,
-      config.maxJobsPerIpPerDay,
-    )
-    if (!capacity)
+    const capacityRequest = {
+      sessionHash: guest(request).guestSessionId,
+      ipHash: requestIpHash(request, config.sessionSecret),
+      count: accepted.length,
+      maxPerSessionDay: config.maxJobsPerSessionPerDay,
+      maxPerIpHour: config.maxJobsPerIpPerHour,
+      maxPerIpDay: config.maxJobsPerIpPerDay,
+      captchaThresholdPerIpHour: config.captchaThresholdPerIpHour,
+      captchaThresholdPerIpDay: config.captchaThresholdPerIpDay,
+      maxConcurrentPerSession: config.maxConcurrentFallbacksPerSession,
+      requireCaptcha: Boolean(config.turnstileSecretKey),
+      captchaVerified: false,
+    }
+    let capacity = await store.reserveCapacity(capacityRequest)
+    if (capacity === "captcha_required") {
+      const verified =
+        Boolean(parsed.captchaToken) &&
+        (await verifyCaptcha(parsed.captchaToken!, request.ip))
+      if (!verified)
+        throw new ApiError(
+          403,
+          "Please complete the verification before using more compatibility fallbacks.",
+          "CAPTCHA_REQUIRED",
+        )
+      capacity = await store.reserveCapacity({
+        ...capacityRequest,
+        captchaVerified: true,
+      })
+    }
+    if (capacity === "concurrent_limit")
       throw new ApiError(
         429,
-        "This browser or network has reached today's processing limit.",
-        "JOB_LIMIT_REACHED",
+        "This browser already has the maximum number of active fallback extractions.",
+        "CONCURRENT_FALLBACK_LIMIT",
+      )
+    if (capacity !== "reserved")
+      throw new ApiError(
+        429,
+        "This browser or network has reached the compatibility fallback limit.",
+        "FALLBACK_RATE_LIMITED",
       )
 
     const rows = accepted.map((file, index) => {
@@ -169,13 +191,7 @@ export function createApp(config: AppConfig, store: ApiStore) {
     )
     response.status(201).json({
       uploads,
-      skipped,
-      message:
-        skipped > 0
-          ? `${skipped} video${
-              skipped === 1 ? " was" : "s were"
-            } skipped because a batch can contain 10.`
-          : undefined,
+      skipped: 0,
     })
   })
 
@@ -231,7 +247,7 @@ export function createApp(config: AppConfig, store: ApiStore) {
       request.params.batchId,
       guest(request).guestSessionId,
     )
-    response.json(await publicBatch(store, batch, config))
+    response.json(publicBatch(batch))
   })
 
   app.post("/api/jobs/:jobId/cancel", async (request, response) => {
@@ -309,38 +325,32 @@ export function createApp(config: AppConfig, store: ApiStore) {
     response.redirect(302, url)
   })
 
-  app.get("/api/batches/:batchId/download-all", async (request, response) => {
-    const batch = await store.getBatchOwned(
-      idSchema.parse(request.params.batchId),
+  app.get("/api/jobs/:jobId/content", async (request, response) => {
+    const job = await store.getJobOwned(
+      idSchema.parse(request.params.jobId),
       guest(request).guestSessionId,
     )
-    if (!batch)
+    if (!job)
       throw new ApiError(
         403,
-        "This ZIP does not belong to your browser session.",
+        "This PNG does not belong to your browser session.",
         "DOWNLOAD_FORBIDDEN",
       )
-    const ready = batch.jobs.filter((job) => job.status === "ready")
-    if (ready.length === 0)
+    if (job.status !== "ready")
       throw new ApiError(
-        409,
-        "No PNG frames are ready to download yet.",
-        "NO_READY_OUTPUTS",
+        404,
+        "That PNG is not ready or no longer exists.",
+        "OUTPUT_NOT_FOUND",
       )
-    response.attachment(`firstframe-${batch.id.slice(0, 8)}.zip`)
-    response.type("application/zip")
-    const archive = archiver("zip", { zlib: { level: 6 } })
-    archive.on("error", (error) => response.destroy(error))
-    archive.pipe(response)
-    const used = new Set<string>()
-    for (const job of ready) {
-      const name = uniqueOutputName(
-        safeDownloadBaseName(job.original_name),
-        used,
-      )
-      archive.append(await store.openOutput(job.output_storage_key), { name })
-    }
-    await archive.finalize()
+    response.type("image/png")
+    response.setHeader("Cache-Control", "private, no-store")
+    response.setHeader(
+      "Content-Disposition",
+      `inline; filename="${safeDownloadBaseName(job.original_name)}"`,
+    )
+    const output = await store.openOutput(job.output_storage_key)
+    output.on("error", (error) => response.destroy(error))
+    output.pipe(response)
   })
 
   app.use(notFound)

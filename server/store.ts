@@ -24,6 +24,22 @@ export interface NewUploadingJob {
   mime_type: string
 }
 
+export type CapacityDecision = "reserved" | "captcha_required" | "concurrent_limit" | "rate_limited"
+
+export interface CapacityRequest {
+  sessionHash: string
+  ipHash: string
+  count: number
+  maxPerSessionDay: number
+  maxPerIpHour: number
+  maxPerIpDay: number
+  captchaThresholdPerIpHour: number
+  captchaThresholdPerIpDay: number
+  maxConcurrentPerSession: number
+  requireCaptcha: boolean
+  captchaVerified: boolean
+}
+
 export interface ApiStore {
   createBatch(guestSessionId: string, expiresAt: string): Promise<InternalBatch>
   getBatchOwned(
@@ -34,13 +50,7 @@ export interface ApiStore {
     jobId: string,
     guestSessionId: string,
   ): Promise<InternalFrameJob | null>
-  reserveCapacity(
-    sessionHash: string,
-    ipHash: string,
-    count: number,
-    maxPerSession: number,
-    maxPerIp: number,
-  ): Promise<boolean>
+  reserveCapacity(request: CapacityRequest): Promise<CapacityDecision>
   createUploadingJobs(jobs: NewUploadingJob[]): Promise<InternalFrameJob[]>
   createSignedUploadUrl(storageKey: string): Promise<string>
   sourceObjectSize(storageKey: string): Promise<number | null>
@@ -151,22 +161,29 @@ export class SupabaseApiStore implements ApiStore {
     return batch ? publicJob(job as JobRow) : null
   }
 
-  async reserveCapacity(
-    sessionHash: string,
-    ipHash: string,
-    count: number,
-    maxPerSession: number,
-    maxPerIp: number,
-  ): Promise<boolean> {
-    const { data, error } = await this.client.rpc("reserve_job_capacity", {
-      p_session_hash: sessionHash,
-      p_ip_hash: ipHash,
-      p_count: count,
-      p_max_per_session: maxPerSession,
-      p_max_per_ip: maxPerIp,
+  async reserveCapacity(request: CapacityRequest): Promise<CapacityDecision> {
+    const { data, error } = await this.client.rpc("reserve_fallback_capacity", {
+      p_session_hash: request.sessionHash,
+      p_ip_hash: request.ipHash,
+      p_count: request.count,
+      p_max_per_session_day: request.maxPerSessionDay,
+      p_max_per_ip_hour: request.maxPerIpHour,
+      p_max_per_ip_day: request.maxPerIpDay,
+      p_captcha_threshold_ip_hour: request.captchaThresholdPerIpHour,
+      p_captcha_threshold_ip_day: request.captchaThresholdPerIpDay,
+      p_max_concurrent_per_session: request.maxConcurrentPerSession,
+      p_require_captcha: request.requireCaptcha,
+      p_captcha_verified: request.captchaVerified,
     })
     if (error) throw error
-    return data === true
+    if (
+      data === "reserved" ||
+      data === "captcha_required" ||
+      data === "concurrent_limit" ||
+      data === "rate_limited"
+    )
+      return data
+    throw new Error("Unexpected fallback capacity response")
   }
 
   async createUploadingJobs(
