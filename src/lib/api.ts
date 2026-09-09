@@ -9,6 +9,9 @@ const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8787"
 ).replace(/\/$/, "")
 
+export const SERVER_FALLBACK_ENABLED =
+  import.meta.env.VITE_SERVER_FALLBACK_ENABLED !== "false"
+
 export class FirstFrameApiError extends Error {
   constructor(
     message: string,
@@ -19,7 +22,16 @@ export class FirstFrameApiError extends Error {
   }
 }
 
+function requireServerFallback(): void {
+  if (!SERVER_FALLBACK_ENABLED)
+    throw new FirstFrameApiError(
+      "The public version processes videos only on your device.",
+      "SERVER_FALLBACK_DISABLED",
+    )
+}
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  requireServerFallback()
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: "include",
@@ -58,15 +70,14 @@ export const firstFrameApi = {
   clearBatch: (batchId: string) =>
     api<void>(`/api/batches/${batchId}/clear`, { method: "POST" }),
   fetchOutput: async (jobId: string) => {
+    requireServerFallback()
     const response = await fetch(`${API_BASE}/api/jobs/${jobId}/content`, {
       credentials: "include",
     })
     if (!response.ok) {
-      const body = (await response
-        .json()
-        .catch(() => ({
-          error: "The PNG could not be downloaded.",
-        }))) as ApiErrorBody
+      const body = (await response.json().catch(() => ({
+        error: "The PNG could not be downloaded.",
+      }))) as ApiErrorBody
       throw new FirstFrameApiError(body.error, body.code, body.details)
     }
     return response.blob()
@@ -100,6 +111,7 @@ export function uploadToSignedUrl(
 }
 
 export function downloadFromApi(path: string): void {
+  requireServerFallback()
   const link = document.createElement("a")
   link.href = `${API_BASE}${path}`
   link.target = "_self"

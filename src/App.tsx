@@ -5,6 +5,7 @@ import {
   downloadFromApi,
   FirstFrameApiError,
   firstFrameApi,
+  SERVER_FALLBACK_ENABLED,
   uploadToSignedUrl,
 } from "./lib/api"
 import {
@@ -1191,7 +1192,7 @@ function Footer() {
   )
 }
 
-type FallbackCandidate = { file: File; placeholderId: string }
+type FallbackCandidate = { file: File placeholderId: string }
 
 function acceptedVideo(file: File): boolean {
   const dot = file.name.lastIndexOf(".")
@@ -1212,7 +1213,7 @@ function fallbackMimeType(file: File): string {
 
 export default function App() {
   const [batchId, setBatchId] = useState<string | null>(() =>
-    sessionStorage.getItem("firstframe_batch"),
+    SERVER_FALLBACK_ENABLED ? sessionStorage.getItem("firstframe_batch") : null,
   )
   const batchIdRef = useRef(batchId)
   const [jobs, setJobs] = useState<ClientFrameJob[]>([])
@@ -1506,15 +1507,22 @@ export default function App() {
       )
 
       if (fallbacks.length) {
-        setNotice(
-          `${fallbacks.length} video${
-            fallbacks.length === 1 ? " needs" : "s need"
-          } the secure compatibility fallback…`,
-        )
-        await uploadFallbacks(fallbacks)
-        setNotice(
-          "Local frames are ready. Compatibility fallbacks are extracting one at a time.",
-        )
+        if (!SERVER_FALLBACK_ENABLED) {
+          const message =
+            "This video cannot be decoded by this browser. The public version processes videos only on your device."
+          failPlaceholders(fallbacks, message)
+          setNotice(message)
+        } else {
+          setNotice(
+            `${fallbacks.length} video${
+              fallbacks.length === 1 ? " needs" : "s need"
+            } the secure compatibility fallback…`,
+          )
+          await uploadFallbacks(fallbacks)
+          setNotice(
+            "Local frames are ready. Compatibility fallbacks are extracting one at a time.",
+          )
+        }
       } else {
         setNotice("Processed privately on your device. Nothing was uploaded.")
       }

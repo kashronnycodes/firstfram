@@ -23,6 +23,7 @@ describe("browser downloads", () => {
   afterEach(() => {
     FakeXmlHttpRequest.instances = []
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
@@ -86,12 +87,26 @@ describe("browser downloads", () => {
     expect(click).toHaveBeenCalledOnce()
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:local-png")
   })
+
+  it("blocks backend navigation in the browser-only public build", async () => {
+    vi.stubEnv("VITE_SERVER_FALLBACK_ENABLED", "false")
+    vi.resetModules()
+    const { downloadFromApi: downloadWithoutBackend } = await import("./api")
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+
+    expect(() => downloadWithoutBackend("/api/jobs/example/download")).toThrow(
+      "The public version processes videos only on your device.",
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
 })
 
 describe("signed fallback uploads", () => {
   afterEach(() => {
     FakeXmlHttpRequest.instances = []
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 

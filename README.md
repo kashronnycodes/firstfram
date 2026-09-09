@@ -59,7 +59,13 @@ pnpm dev:worker
 
 The frontend defaults to `http://localhost:8443` and the API to `http://localhost:8787`.
 
-## 4. Production processes
+## 4. GitHub Pages
+
+The included GitHub Actions workflow publishes a browser-only build to GitHub Pages whenever `main` changes. This public build keeps compatible video processing and PNG/ZIP creation entirely on the visitor's device. It deliberately disables the private API/FFmpeg fallback because GitHub Pages cannot run server processes.
+
+In the GitHub repository, open **Settings → Pages** and set **Source** to **GitHub Actions**. The workflow builds with the repository subpath and deploys `dist` without requiring secrets.
+
+## 5. Production processes
 
 Build the frontend and Node services:
 
